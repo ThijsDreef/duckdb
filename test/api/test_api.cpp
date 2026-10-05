@@ -969,3 +969,49 @@ TEST_CASE("Test ClientInterruptState suppresses interrupts after irreversible op
 		REQUIRE_NO_FAIL(con.Query("DROP TABLE suppress_test"));
 	}
 }
+
+TEST_CASE("Test ExtractStatements error location", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	auto get_error = [&](const string &query) {
+		try {
+			con.ExtractStatements(query);
+		} catch (std::exception &ex) {
+			return ErrorData(ex).Message();
+		}
+		return string();
+	};
+
+	// parser errors report the line within the full query
+	auto error = get_error("SELECT 42;\nSELECT 43;\nSELEC 44;");
+	REQUIRE(StringUtil::Contains(error, "Parser Error"));
+	REQUIRE(StringUtil::Contains(error, "LINE 3: SELEC 44;"));
+
+	error = get_error("SELECT 42; SELECT 43;\n\nSELECT *\nFROM (SELEC 1);");
+	REQUIRE(StringUtil::Contains(error, "LINE 4: FROM (SELEC 1);"));
+
+	// errors thrown while preprocessing are also reported
+	error = get_error("SELECT 42;\nSELECT 43;\nPRAGMA non_existent_pragma;");
+	REQUIRE(StringUtil::Contains(error, "non_existent_pragma does not exist"));
+
+	// the connection is still usable afterwards
+	REQUIRE_NO_FAIL(con.Query("SELECT 42"));
+}
+
+TEST_CASE("Test ExtractStatements with chained BEGIN, body and COMMIT", "[api]") {
+	DuckDB db(nullptr);
+	Connection con(db);
+
+	REQUIRE_NO_FAIL(con.Query("CREATE TABLE t AS SELECT range::INT AS id FROM range(10)"));
+	REQUIRE_NO_FAIL(con.Query("ATTACH ':memory:' AS dst"));
+
+	// the multi-statement body joins the explicit transaction instead of opening its own
+	auto statements = con.ExtractStatements("BEGIN; COPY FROM DATABASE memory TO dst; COMMIT;");
+	for (auto &stmt : statements) {
+		REQUIRE_NO_FAIL(con.Query(std::move(stmt)));
+	}
+
+	auto result = con.Query("SELECT count(*) FROM dst.t");
+	REQUIRE(CHECK_COLUMN(result, 0, {10}));
+}
