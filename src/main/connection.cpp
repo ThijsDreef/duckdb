@@ -169,15 +169,20 @@ unique_ptr<TableDescription> Connection::TableInfo(const Identifier &table_name)
 }
 
 vector<unique_ptr<SQLStatement>> Connection::ExtractStatements(const string &query) {
-	// Eager convenience over the lazy ClientContext::ExtractStatements iterator: drain the
-	// engine-facing statements into a vector.
+	// Statements do not execute so collect and preprocess in one go to
+	// preserve being able to sequentially execute extracted statements
 	auto &client_context = *context;
-	auto iterator = client_context.IterateStatements(query);
 	vector<unique_ptr<SQLStatement>> result;
-	while (iterator.Peek()) {
-		if (auto statement = iterator.GetStatement()) {
-			result.push_back(std::move(statement));
+	try {
+		ParseIterator iterator(client_context, query);
+		while (iterator.Peek()) {
+			result.push_back(iterator.GetStatement());
 		}
+		client_context.PreprocessStatements(result);
+	} catch (std::exception &ex) {
+		ErrorData error(ex);
+		client_context.ProcessError(error, query);
+		error.Throw();
 	}
 	return result;
 }
