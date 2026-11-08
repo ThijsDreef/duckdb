@@ -86,6 +86,7 @@ public:
 	atomic<bool> optimistically_written;
 	idx_t minimum_memory_per_thread;
 
+	bool PrecedingBatchesExceedMemory(const idx_t batch_index, const idx_t min_batch_index);
 	bool ReadyToMerge(const idx_t count) const;
 	void ScheduleMergeTasks(ClientContext &context, const idx_t min_batch_index);
 	PhysicalIndex MergeCollections(ClientContext &context, const vector<RowGroupBatchEntry> &merge_collections,
@@ -274,6 +275,29 @@ void BatchInsertGlobalState::ScheduleMergeTasks(ClientContext &context, const id
 	}
 }
 
+//! Whether the unflushed batches from the min batch index up to the given batch exceed the available memory. Batches
+//! after the given batch are not counted, so that batches far ahead of the min batch index cannot hold up the batches
+//! before them.
+bool BatchInsertGlobalState::PrecedingBatchesExceedMemory(const idx_t batch_index, const idx_t min_batch_index) {
+#ifdef DUCKDB_ALTERNATIVE_VERIFY
+	// alternative verify - always report that the memory is exceeded to test the blocking code path
+	return true;
+#else
+	annotated_lock_guard<annotated_mutex> l(lock);
+	// batches before the min batch index are finished and will be merged - they do not hold up this batch
+	auto entry =
+	    std::lower_bound(collections.begin(), collections.end(), min_batch_index,
+	                     [](const RowGroupBatchEntry &a, const idx_t min_index) { return a.batch_idx < min_index; });
+	idx_t unflushed_memory = 0;
+	for (; entry != collections.end() && entry->batch_idx < batch_index; entry++) {
+		if (entry->type == RowGroupBatchType::NOT_FLUSHED) {
+			unflushed_memory += entry->unflushed_memory;
+		}
+	}
+	return unflushed_memory >= memory_manager.AvailableMemory();
+#endif
+}
+
 PhysicalIndex BatchInsertGlobalState::MergeCollections(ClientContext &context,
                                                        const vector<RowGroupBatchEntry> &merge_collections,
                                                        OptimisticDataWriter &writer) {
@@ -439,16 +463,17 @@ SinkResultType PhysicalBatchInsert::Sink(ExecutionContext &context, DataChunk &i
 		memory_manager.UpdateMinBatchIndex(lstate.partition_info.min_batch_index.GetIndex());
 
 		// we are not processing the current min batch index
-		// check if we have exceeded the maximum number of unflushed rows
-		if (memory_manager.OutOfMemory(batch_index)) {
+		// check if we are out of memory - and if so, if the batches before us use up the available memory
+		if (memory_manager.OutOfMemory(batch_index) &&
+		    gstate.PrecedingBatchesExceedMemory(batch_index, lstate.partition_info.min_batch_index.GetIndex())) {
 			// out-of-memory
 			// execute tasks while we wait (if any are available)
 			ExecuteTasks(context.client, gstate, lstate);
 
 			const annotated_lock_guard<annotated_mutex> guard {memory_manager.lock};
 			if (!memory_manager.IsMinimumBatchIndex(batch_index)) {
-				//  we are not the minimum batch index and we have no memory available to buffer - block the task for
-				//  now
+				//  we are not the minimum batch index and the batches before us use the available memory - block the
+				//  task for now
 				return memory_manager.BlockSink(input.interrupt_state);
 			}
 		}
